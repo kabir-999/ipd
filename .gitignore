@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Backend runtime artifacts
+backend/data/
+backend/generated/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Env files
+.env
+backend/.env
+frontend/.env
+/Users/kabirmathur/Documents/IPD_PROJECT/backend/.env.example
+
+.env
+backend/.env
+frontend/.env
