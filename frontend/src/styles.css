@@ -40,7 +40,8 @@ body {
   font-weight: 700;
 }
 
-#controls input {
+#controls input,
+#controls select {
   padding: 6px 8px;
   border-radius: 6px;
   border: 1px solid #cfd8dc;
@@ -165,6 +166,15 @@ td {
   border-radius: 8px;
   border: 1px solid #dfe7ec;
   margin-bottom: 8px;
+}
+
+.year-map-view {
+  width: 100%;
+  height: 220px;
+  border-radius: 8px;
+  border: 1px solid #dfe7ec;
+  margin-bottom: 8px;
+  overflow: hidden;
 }
 
 .coverage-text {

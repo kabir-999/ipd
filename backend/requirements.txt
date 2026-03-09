@@ -1,6 +1,7 @@
 fastapi==0.115.8
+pydantic==2.10.6
 uvicorn[standard]==0.34.0
-numpy==2.2.3
+numpy==1.26.4
 python-dotenv==1.0.1
 tensorflow==2.18.0
 earthengine-api==1.5.3

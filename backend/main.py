@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import AsyncIterator
 
 import ee
-import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from gee_utils import init_ee, process_year_with_visuals
 from model_adapter import predict_risk_with_debug
@@ -26,26 +24,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 LOGGER = logging.getLogger("vegetation-api")
 
 MAX_YEAR_IMAGES = 10
-GENERATED_DIR = BASE_DIR / "generated"
-GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Vegetation Monitoring API", version="5.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    init_ee()
+    LOGGER.info("Earth Engine initialized at startup with project trusty-entity-462211-b8")
+    yield
+
+
+app = FastAPI(title="Vegetation Monitoring API", version="5.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generated")
-
-
-@app.on_event("startup")
-def startup_init() -> None:
-    init_ee()
-    LOGGER.info("Earth Engine initialized at startup with project trusty-entity-462211-b8")
 
 
 class ErrorResponse(BaseModel):
@@ -56,6 +51,8 @@ class AnalyzeRequest(BaseModel):
     bbox: list[float] = Field(min_length=4, max_length=4)
     startYear: int
     endYear: int
+    month: int
+    day: int = 1
 
     @field_validator("startYear", "endYear")
     @classmethod
@@ -78,6 +75,20 @@ class AnalyzeRequest(BaseModel):
         if min_lon < -180 or max_lon > 180 or min_lat < -90 or max_lat > 90:
             raise ValueError("bbox values are out of geographic range")
 
+        return value
+
+    @field_validator("month")
+    @classmethod
+    def validate_month(cls, value: int) -> int:
+        if value < 1 or value > 12:
+            raise ValueError("month must be between 1 and 12")
+        return value
+
+    @field_validator("day")
+    @classmethod
+    def validate_day(cls, value: int) -> int:
+        if value < 1 or value > 31:
+            raise ValueError("day must be between 1 and 31")
         return value
 
 
@@ -118,20 +129,8 @@ def analyze(payload: AnalyzeRequest) -> dict[str, object]:
     vegetation_series: list[float] = []
     maps: dict[str, dict[str, str]] = {}
 
-    http = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    http.mount("https://", adapter)
-    http.mount("http://", adapter)
-
     for year in requested_years:
-        feature, map_urls, year_debug = process_year_with_visuals(aoi, payload.bbox, year, GENERATED_DIR, http)
+        feature, map_urls, year_debug = process_year_with_visuals(aoi, year, payload.month, payload.day)
         debug.extend(year_debug)
 
         if feature is None or map_urls is None:

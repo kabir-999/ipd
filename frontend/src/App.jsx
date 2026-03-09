@@ -13,10 +13,25 @@ import {
 } from 'recharts';
 import { MapContainer, Rectangle, TileLayer, useMap, useMapEvents } from 'react-leaflet';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001';
 const MAX_YEAR_RANGE = 10;
 const DEFAULT_CENTER = [20.5937, 78.9629];
 const DEFAULT_ZOOM = 5;
+const MONTHS = [
+  { value: 1, label: 'January' },
+  { value: 2, label: 'February' },
+  { value: 3, label: 'March' },
+  { value: 4, label: 'April' },
+  { value: 5, label: 'May' },
+  { value: 6, label: 'June' },
+  { value: 7, label: 'July' },
+  { value: 8, label: 'August' },
+  { value: 9, label: 'September' },
+  { value: 10, label: 'October' },
+  { value: 11, label: 'November' },
+  { value: 12, label: 'December' }
+];
+const DAYS = Array.from({ length: 31 }, (_, index) => index + 1);
 
 async function fetchJson(url, options = {}, timeoutMs = 600000) {
   const controller = new AbortController();
@@ -101,7 +116,8 @@ function getYearVisualRows(result, featureRows) {
       if (!mapSet) return null;
       return {
         year: row.year,
-        ndviUrl: mapSet.ndvi,
+        ndviTileUrl: mapSet.ndviTileUrl || '',
+        ndviUrl: mapSet.ndvi || '',
         vegetationPercent: row.vegetationPercent ?? 0
       };
     })
@@ -148,6 +164,40 @@ function MapNavigator({ center }) {
   }, [map, center]);
 
   return null;
+}
+
+function MapFitter({ bounds }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (bounds) {
+      map.fitBounds(bounds, { padding: [8, 8] });
+    }
+  }, [map, bounds]);
+
+  return null;
+}
+
+function YearNdviMap({ tileUrl, bounds }) {
+  const fallbackCenter = bounds
+    ? [(bounds[0][0] + bounds[1][0]) / 2, (bounds[0][1] + bounds[1][1]) / 2]
+    : DEFAULT_CENTER;
+
+  return (
+    <MapContainer
+      className="year-map-view"
+      center={fallbackCenter}
+      zoom={10}
+      scrollWheelZoom={false}
+      attributionControl={false}
+      zoomControl={false}
+    >
+      <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" opacity={0.5} />
+      <TileLayer url={tileUrl} opacity={0.85} />
+      {bounds && <Rectangle bounds={bounds} pathOptions={{ color: '#d32f2f', weight: 1 }} />}
+      <MapFitter bounds={bounds} />
+    </MapContainer>
+  );
 }
 
 function DrawControl({ onSelect, onClear }) {
@@ -211,7 +261,10 @@ export default function App() {
   const [mapCenter, setMapCenter] = useState(DEFAULT_CENTER);
   const [startYear, setStartYear] = useState(currentYear - 3);
   const [endYear, setEndYear] = useState(currentYear);
+  const [month, setMonth] = useState(new Date().getMonth() + 1);
+  const [day, setDay] = useState(new Date().getDate());
   const [bbox, setBbox] = useState(null);
+  const [resultBbox, setResultBbox] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -219,7 +272,8 @@ export default function App() {
   const chartData = useMemo(() => toChartData(result), [result]);
   const featureRows = useMemo(() => getFeatureRows(result), [result]);
   const yearVisualRows = useMemo(() => getYearVisualRows(result, featureRows), [result, featureRows]);
-  const rectangleBounds = useMemo(() => bboxToLeafletBounds(bbox), [bbox]);
+  const selectionBounds = useMemo(() => bboxToLeafletBounds(bbox), [bbox]);
+  const resultBounds = useMemo(() => bboxToLeafletBounds(resultBbox), [resultBbox]);
 
   function validateInputs() {
     const start = Number(startYear);
@@ -227,6 +281,18 @@ export default function App() {
 
     if (!Number.isInteger(start) || !Number.isInteger(end)) {
       setError('Start year and end year must be integers.');
+      return false;
+    }
+
+    const selectedMonth = Number(month);
+    if (!Number.isInteger(selectedMonth) || selectedMonth < 1 || selectedMonth > 12) {
+      setError('Month must be between 1 and 12.');
+      return false;
+    }
+
+    const selectedDay = Number(day);
+    if (!Number.isInteger(selectedDay) || selectedDay < 1 || selectedDay > 31) {
+      setError('Day must be between 1 and 31.');
       return false;
     }
 
@@ -270,21 +336,26 @@ export default function App() {
   async function runAnalysis() {
     setError('');
     setResult(null);
+    setResultBbox(null);
 
     if (!validateInputs()) return;
 
+    const analysisBbox = [...bbox];
     setLoading(true);
     try {
       const data = await fetchJson(`${API_BASE}/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          bbox,
+          bbox: analysisBbox,
           startYear: Number(startYear),
-          endYear: Number(endYear)
+          endYear: Number(endYear),
+          month: Number(month),
+          day: Number(day)
         })
       });
       setResult(data);
+      setResultBbox(analysisBbox);
     } catch (err) {
       setError(err.message || 'Analysis failed');
     } finally {
@@ -325,6 +396,26 @@ export default function App() {
             onChange={(event) => setEndYear(event.target.value)}
           />
         </label>
+        <label>
+          Month
+          <select value={month} onChange={(event) => setMonth(event.target.value)}>
+            {MONTHS.map((entry) => (
+              <option key={entry.value} value={entry.value}>
+                {entry.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Day
+          <select value={day} onChange={(event) => setDay(event.target.value)}>
+            {DAYS.map((value) => (
+              <option key={value} value={value}>
+                {value}
+              </option>
+            ))}
+          </select>
+        </label>
         <button type="button" onClick={goToDestination} disabled={loading}>Go to Place</button>
         <button onClick={runAnalysis} disabled={loading}>{loading ? 'Running...' : 'Run Analysis'}</button>
       </div>
@@ -341,7 +432,7 @@ export default function App() {
             <AOISelector onSelect={setBbox} />
             <DrawControl onSelect={setBbox} onClear={() => setBbox(null)} />
 
-            {rectangleBounds && <Rectangle bounds={rectangleBounds} pathOptions={{ color: '#d32f2f', weight: 2 }} />}
+            {selectionBounds && <Rectangle bounds={selectionBounds} pathOptions={{ color: '#d32f2f', weight: 2 }} />}
           </MapContainer>
         </div>
 
@@ -399,7 +490,11 @@ export default function App() {
                   {yearVisualRows.map((row) => (
                     <div className="year-map-card" key={`maps-${row.year}`}>
                       <h3>NDVI Map - {row.year}</h3>
-                      <img src={`${API_BASE}${row.ndviUrl}`} alt={`NDVI map ${row.year}`} loading="lazy" />
+                      {row.ndviTileUrl ? (
+                        <YearNdviMap tileUrl={row.ndviTileUrl} bounds={resultBounds} />
+                      ) : (
+                        <img src={`${API_BASE}${row.ndviUrl}`} alt={`NDVI map ${row.year}`} loading="lazy" />
+                      )}
                       <p className="coverage-text">Vegetation Cover: {Number(row.vegetationPercent).toFixed(2)}%</p>
                     </div>
                   ))}
