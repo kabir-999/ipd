@@ -69,7 +69,7 @@ function bboxToLeafletBounds(bbox) {
 }
 
 function makePointBbox(lat, lon) {
-  const delta = 0.2;
+  const delta = 0.05;
   return [lon - delta, lat - delta, lon + delta, lat + delta];
 }
 

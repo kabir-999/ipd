@@ -126,6 +126,10 @@ def analyze(payload: AnalyzeRequest) -> dict[str, object]:
     features: list[dict[str, float | int]] = []
     years: list[int] = []
     ndvi_series: list[float] = []
+    ndwi_series: list[float] = []
+    evi_series: list[float] = []
+    ndmi_series: list[float] = []
+    savi_series: list[float] = []
     vegetation_series: list[float] = []
     maps: dict[str, dict[str, str]] = {}
 
@@ -139,6 +143,10 @@ def analyze(payload: AnalyzeRequest) -> dict[str, object]:
         features.append(feature)
         years.append(int(feature["year"]))
         ndvi_series.append(float(feature["ndvi"]))
+        ndwi_series.append(float(feature["ndwi"]))
+        evi_series.append(float(feature["evi"]))
+        ndmi_series.append(float(feature["ndmi"]))
+        savi_series.append(float(feature["savi"]))
         vegetation_series.append(float(feature["vegetationPercent"]))
         maps[str(year)] = map_urls
 
@@ -151,7 +159,12 @@ def analyze(payload: AnalyzeRequest) -> dict[str, object]:
     return {
         "years": years,
         "ndvi": ndvi_series,
+        "ndwi": ndwi_series,
+        "evi": evi_series,
+        "ndmi": ndmi_series,
+        "savi": savi_series,
         "vegetation": vegetation_series,
+        "features": features,
         "maps": maps,
         "risk": risk,
         "debug": debug,

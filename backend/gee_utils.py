@@ -1,19 +1,26 @@
 from __future__ import annotations
 
-import calendar
 import logging
-from datetime import date, timedelta
 
 import ee
 
 LOGGER = logging.getLogger("vegetation-api")
 
-REQUIRED_9_BANDS = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A"]
+PROCESS_BANDS = ["B2", "B3", "B4", "B8", "B8A", "B11"]
 WEB_MERCATOR = "EPSG:3857"
 CLOUD_BIT_MASK = 1 << 10
 CIRRUS_BIT_MASK = 1 << 11
 CLOUD_SHADOW_SCL_CLASS = 3
 CLOUD_SCL_CLASSES = [8, 9, 10]
+PRIMARY_SCENE_LIMIT = 3
+FALLBACK_SCENE_LIMIT = 3
+MIN_PRIMARY_SCENES = 1
+MIN_VALID_COVERAGE = 0.35
+NDVI_VEG_THRESHOLD = 0.35
+EVI_VEG_THRESHOLD = 0.20
+SAVI_VEG_THRESHOLD = 0.25
+NDMI_VEG_THRESHOLD = 0.00
+NDWI_VEG_THRESHOLD = -0.05
 
 
 def init_ee() -> None:
@@ -62,26 +69,14 @@ def _valid_fraction_for_b4(image: ee.Image, aoi: ee.Geometry) -> float:
     return _safe_number(valid_fraction_raw.getInfo(), 6)
 
 
-def _build_composite(
-    base_collection: ee.ImageCollection,
-    aoi: ee.Geometry,
-    start_date: date,
-    end_date: date,
-    apply_mask: bool,
-) -> tuple[ee.Image | None, int, float]:
-    collection = base_collection.filterDate(start_date.isoformat(), end_date.isoformat())
-    if apply_mask:
-        collection = collection.map(_mask_clouds_and_shadows)
-
-    collection = collection.map(lambda img: img.select(REQUIRED_9_BANDS).toFloat())
-    image_count = int(collection.size().getInfo())
-    if image_count == 0:
-        return None, 0, 0.0
-
-    image = ee.Image(collection.median()).clip(aoi)
-    if apply_mask:
-        return image, image_count, _valid_fraction_for_b4(image, aoi)
-    return image, image_count, 1.0
+def _composite_from_collection(collection: ee.ImageCollection, aoi: ee.Geometry) -> tuple[ee.Image, float]:
+    masked_collection = (
+        collection
+        .map(_mask_clouds_and_shadows)
+        .map(lambda img: img.select(PROCESS_BANDS).toFloat())
+    )
+    image = ee.Image(masked_collection.median()).clip(aoi)
+    return image, _valid_fraction_for_b4(image, aoi)
 
 
 def process_year_with_visuals(
@@ -93,16 +88,16 @@ def process_year_with_visuals(
     debug: list[str] = []
 
     try:
-        month_start_date = date(year, month, 1)
+        month_start = f"{year}-{month:02d}-01"
         if month == 12:
-            month_end_date = date(year + 1, 1, 1)
+            month_end = f"{year + 1}-01-01"
         else:
-            month_end_date = date(year, month + 1, 1)
+            month_end = f"{year}-{month + 1:02d}-01"
 
         month_scene_collection = (
             ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
             .filterBounds(aoi)
-            .filterDate(month_start_date.isoformat(), month_end_date.isoformat())
+            .filterDate(month_start, month_end)
             # Keep more scenes and evaluate with pixel-level cloud/shadow masks.
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 80))
         )
@@ -118,81 +113,107 @@ def process_year_with_visuals(
             LOGGER.warning(warn)
             return None, None, debug
 
-        month_days = calendar.monthrange(year, month)[1]
-        start_day = min(max(int(day), 1), month_days)
-        selected_image: ee.Image | None = None
-        selected_mode = ""
-        selected_valid_fraction = 0.0
-        month_masked_image, masked_count, masked_valid_fraction = _build_composite(
-            month_scene_collection, aoi, month_start_date, month_end_date, apply_mask=True
-        )
-        debug.append(
-            f"Year {year}, month {month:02d} - masked monthly pool scenes: {masked_count}, valid coverage: {round(masked_valid_fraction * 100.0, 2)}%"
-        )
+        # Primary pass: same month/day window with limited scenes for speed + stability.
+        day_int = min(max(int(day), 1), 28)
+        window_start = f"{year}-{month:02d}-{day_int:02d}"
+        if month == 12:
+            window_end = f"{year + 1}-01-01"
+        else:
+            window_end = f"{year}-{month + 1:02d}-01"
 
-        # Preferred behavior: same day each year; if unavailable, move forward day by day.
-        for candidate_day in range(start_day, month_days + 1):
-            day_start = date(year, month, candidate_day)
-            day_end = day_start + timedelta(days=1)
-            day_image, day_count, day_valid_fraction = _build_composite(
-                month_scene_collection, aoi, day_start, day_end, apply_mask=True
-            )
-            debug.append(
-                f"Year {year}, month {month:02d}, day {candidate_day:02d} - masked scenes: {day_count}, valid coverage: {round(day_valid_fraction * 100.0, 2)}%"
-            )
-            if day_image is not None and day_valid_fraction > 0.0:
-                selected_image = day_image
-                selected_mode = f"masked day+ ({candidate_day:02d})"
-                selected_valid_fraction = day_valid_fraction
-                break
+        window_collection = month_scene_collection.filterDate(window_start, window_end).sort("CLOUDY_PIXEL_PERCENTAGE")
+        window_count = int(window_collection.size().getInfo())
+        debug.append(f"Year {year}, month {month:02d} - day-window scenes found: {window_count}")
 
-        if selected_image is None and month_masked_image is not None and masked_valid_fraction > 0.0:
-            selected_image = month_masked_image
-            selected_mode = "masked monthly fallback"
-            selected_valid_fraction = masked_valid_fraction
+        if window_count >= MIN_PRIMARY_SCENES:
+            primary_collection = window_collection.limit(PRIMARY_SCENE_LIMIT)
+            source_label = "day-window composite"
+        else:
+            primary_collection = month_scene_collection.sort("CLOUDY_PIXEL_PERCENTAGE").limit(PRIMARY_SCENE_LIMIT)
+            source_label = "month composite fallback"
 
-        if selected_image is None:
-            warn = f"Year {year}, month {month:02d} - skipped (no valid cloud-masked imagery found)."
+        used_scene_count = int(primary_collection.size().getInfo())
+        debug.append(f"Year {year}, month {month:02d} - scenes used for analysis: {used_scene_count} ({source_label})")
+        if used_scene_count == 0:
+            warn = f"Year {year}, month {month:02d} - skipped (no scenes available for analysis)."
             debug.append(warn)
             LOGGER.warning(warn)
             return None, None, debug
 
-        # Gap-fill day-level masked composite using the full-month masked composite.
-        if selected_mode.startswith("masked day+") and month_masked_image is not None:
-            selected_image = selected_image.unmask(month_masked_image).clip(aoi)
-            selected_valid_fraction = _valid_fraction_for_b4(selected_image, aoi)
-            selected_mode = f"{selected_mode} + masked monthly fill"
+        image, valid_fraction = _composite_from_collection(primary_collection, aoi)
+        debug.append(f"Year {year}, month {month:02d} - valid pixel coverage: {round(valid_fraction * 100.0, 2)}%")
+        selected_source = source_label
 
-        debug.append(
-            f"Year {year}, month {month:02d} - selected source: {selected_mode}, valid coverage: {round(selected_valid_fraction * 100.0, 2)}%"
-        )
-        image = selected_image
+        # Secondary pass: if coverage is poor, use a broader monthly pool.
+        if valid_fraction < MIN_VALID_COVERAGE:
+            fallback_collection = month_scene_collection.sort("CLOUDY_PIXEL_PERCENTAGE").limit(FALLBACK_SCENE_LIMIT)
+            fallback_count = int(fallback_collection.size().getInfo())
+            debug.append(f"Year {year}, month {month:02d} - fallback scenes used: {fallback_count}")
+            if fallback_count > 0:
+                fallback_image, fallback_valid_fraction = _composite_from_collection(fallback_collection, aoi)
+                if fallback_valid_fraction > valid_fraction:
+                    image = fallback_image
+                    valid_fraction = fallback_valid_fraction
+                    selected_source = "broader monthly fallback"
+                    debug.append(
+                        f"Year {year}, month {month:02d} - upgraded to fallback coverage: {round(valid_fraction * 100.0, 2)}%"
+                    )
+
+        if valid_fraction == 0.0:
+            warn = f"Year {year}, month {month:02d} - skipped (no valid cloud-masked pixels in selected/fallback scenes)."
+            debug.append(warn)
+            LOGGER.warning(warn)
+            return None, None, debug
+
+        debug.append(f"Year {year}, month {month:02d} - selected source: {selected_source}")
 
         ndvi = image.normalizedDifference(["B8", "B4"]).rename("ndvi")
-        veg_mask = ndvi.gt(0.3).rename("veg")
+        ndwi = image.normalizedDifference(["B3", "B8"]).rename("ndwi")
+        ndmi = image.normalizedDifference(["B8", "B11"]).rename("ndmi")
+        savi = image.expression(
+            "1.5 * ((nir - red) / (nir + red + 0.5))",
+            {"nir": image.select("B8"), "red": image.select("B4")},
+        ).rename("savi")
+        evi = image.expression(
+            "2.5 * ((nir - red) / (nir + 6.0 * red - 7.5 * blue + 1.0))",
+            {"nir": image.select("B8"), "red": image.select("B4"), "blue": image.select("B2")},
+        ).rename("evi")
 
-        ndvi_mean_raw = ndvi.reduceRegion(
+        veg_score = (
+            ndvi.gt(NDVI_VEG_THRESHOLD)
+            .add(evi.gt(EVI_VEG_THRESHOLD))
+            .add(savi.gt(SAVI_VEG_THRESHOLD))
+            .add(ndmi.gt(NDMI_VEG_THRESHOLD))
+            .add(ndwi.gt(NDWI_VEG_THRESHOLD))
+        )
+        veg_mask = veg_score.gte(3).rename("veg")
+
+        stats_raw = ndvi.addBands([ndwi, evi, ndmi, savi, veg_mask]).reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=aoi,
             scale=10,
             maxPixels=1_000_000_000,
             bestEffort=True,
-        ).get("ndvi")
+        ).getInfo()
 
-        veg_mean_raw = veg_mask.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=aoi,
-            scale=10,
-            maxPixels=1_000_000_000,
-            bestEffort=True,
-        ).get("veg")
-
-        ndvi_mean = _safe_number(ndvi_mean_raw.getInfo(), 6)
-        veg_percent = round(_safe_number(veg_mean_raw.getInfo(), 6) * 100.0, 4)
+        ndvi_mean = _safe_number(stats_raw.get("ndvi"), 6)
+        ndwi_mean = _safe_number(stats_raw.get("ndwi"), 6)
+        evi_mean = _safe_number(stats_raw.get("evi"), 6)
+        ndmi_mean = _safe_number(stats_raw.get("ndmi"), 6)
+        savi_mean = _safe_number(stats_raw.get("savi"), 6)
+        veg_percent = round(_safe_number(stats_raw.get("veg"), 6) * 100.0, 4)
 
         debug.append(f"Year {year}, month {month:02d} - NDVI mean: {ndvi_mean}")
+        debug.append(f"Year {year}, month {month:02d} - NDWI mean: {ndwi_mean}")
+        debug.append(f"Year {year}, month {month:02d} - EVI mean: {evi_mean}")
+        debug.append(f"Year {year}, month {month:02d} - NDMI mean: {ndmi_mean}")
+        debug.append(f"Year {year}, month {month:02d} - SAVI mean: {savi_mean}")
         debug.append(f"Year {year}, month {month:02d} - Vegetation %: {veg_percent}")
         LOGGER.info("Year %s month %02d - NDVI mean: %s", year, month, ndvi_mean)
+        LOGGER.info("Year %s month %02d - NDWI mean: %s", year, month, ndwi_mean)
+        LOGGER.info("Year %s month %02d - EVI mean: %s", year, month, evi_mean)
+        LOGGER.info("Year %s month %02d - NDMI mean: %s", year, month, ndmi_mean)
+        LOGGER.info("Year %s month %02d - SAVI mean: %s", year, month, savi_mean)
         LOGGER.info("Year %s month %02d - Vegetation %%: %s", year, month, veg_percent)
 
         # Render in Web Mercator and stream as EE tiles.
@@ -208,10 +229,10 @@ def process_year_with_visuals(
             "year": year,
             "ndvi": ndvi_mean,
             "vegetationPercent": veg_percent,
-            "ndwi": 0.0,
-            "savi": 0.0,
-            "evi": 0.0,
-            "ndmi": 0.0,
+            "ndwi": ndwi_mean,
+            "savi": savi_mean,
+            "evi": evi_mean,
+            "ndmi": ndmi_mean,
             "nbr": 0.0,
         }
 
