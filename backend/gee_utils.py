@@ -1,248 +1,306 @@
 from __future__ import annotations
 
+import calendar
 import logging
+from datetime import date, timedelta
+from typing import Any
 
 import ee
 
 LOGGER = logging.getLogger("vegetation-api")
 
-PROCESS_BANDS = ["B2", "B3", "B4", "B8", "B8A", "B11"]
+EE_PROJECT = "trusty-entity-462211-b8"
+S2_COLLECTION_ID = "COPERNICUS/S2_SR_HARMONIZED"
+HANSEN_COLLECTION_ID = "UMD/hansen/global_forest_change_2023_v1_11"
+PROCESS_BANDS = ["B2", "B3", "B4", "B8", "B11", "B12"]
+ANALYSIS_SCALE = 10
+MAX_PIXELS = 1_000_000_000
+PRIMARY_WINDOW_DAYS = 45
+FALLBACK_WINDOW_DAYS = 90
+MAX_SCENE_CLOUD_PERCENT = 80
 WEB_MERCATOR = "EPSG:3857"
-CLOUD_BIT_MASK = 1 << 10
-CIRRUS_BIT_MASK = 1 << 11
-CLOUD_SHADOW_SCL_CLASS = 3
-CLOUD_SCL_CLASSES = [8, 9, 10]
-PRIMARY_SCENE_LIMIT = 3
-FALLBACK_SCENE_LIMIT = 3
-MIN_PRIMARY_SCENES = 1
-MIN_VALID_COVERAGE = 0.35
-NDVI_VEG_THRESHOLD = 0.35
-EVI_VEG_THRESHOLD = 0.20
-SAVI_VEG_THRESHOLD = 0.25
-NDMI_VEG_THRESHOLD = 0.00
-NDWI_VEG_THRESHOLD = -0.05
+
+NON_VEGETATION_MAX_NDVI = 0.2
+VEGETATION_MASK_THRESHOLD = 0.3
+DENSE_VEGETATION_MIN_NDVI = 0.5
+TREE_COVER_THRESHOLD = 30
+
+_EE_INITIALIZED = False
 
 
 def init_ee() -> None:
-    # Earth Engine is initialized once at app startup.
-    ee.Initialize(project="trusty-entity-462211-b8")
-    # Increase EE client-side RPC deadline (milliseconds) for heavy AOI/year requests.
-    ee.data.setDeadline(300000)
+    global _EE_INITIALIZED
+
+    if _EE_INITIALIZED:
+        return
+
+    try:
+        ee.Initialize(project=EE_PROJECT)
+        ee.data.setDeadline(300000)
+        _EE_INITIALIZED = True
+    except Exception as exc:
+        raise RuntimeError(f"Earth Engine initialization failed: {exc}") from exc
 
 
-def _safe_number(value: object, decimals: int = 6) -> float:
+def _safe_number(value: Any, decimals: int = 6) -> float:
     if value is None:
         return 0.0
     return round(float(value), decimals)
 
 
-def _mask_clouds_and_shadows(img: ee.Image) -> ee.Image:
-    # QA60 masks opaque clouds/cirrus, and SCL masks cloud shadows and cloud classes.
-    qa60 = img.select("QA60")
-    qa_clear = qa60.bitwiseAnd(CLOUD_BIT_MASK).eq(0).And(qa60.bitwiseAnd(CIRRUS_BIT_MASK).eq(0))
+def _clamp_day(year: int, month: int, day: int) -> int:
+    return min(max(int(day), 1), calendar.monthrange(year, month)[1])
 
-    scl = img.select("SCL")
-    scl_clear = (
-        scl.neq(CLOUD_SHADOW_SCL_CLASS)
-        .And(scl.neq(CLOUD_SCL_CLASSES[0]))
-        .And(scl.neq(CLOUD_SCL_CLASSES[1]))
-        .And(scl.neq(CLOUD_SCL_CLASSES[2]))
+
+def _build_window(year: int, month: int, day: int, window_days: int) -> tuple[str, str]:
+    selected_date = date(year, month, _clamp_day(year, month, day))
+    start_date = selected_date - timedelta(days=window_days // 2)
+    end_date = start_date + timedelta(days=window_days)
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _mask_sentinel2_clouds(image: ee.Image) -> ee.Image:
+    scl = image.select("SCL")
+    clear_mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10))
+
+    return (
+        image.updateMask(clear_mask)
+        .select(PROCESS_BANDS)
+        .multiply(0.0001)
+        .toFloat()
+        .copyProperties(image, image.propertyNames())
     )
 
-    return img.updateMask(qa_clear.And(scl_clear)).copyProperties(img, img.propertyNames())
+
+def _normalize_aoi(aoi: ee.Geometry | list[float] | tuple[float, float, float, float]) -> ee.Geometry:
+    if isinstance(aoi, (list, tuple)):
+        if len(aoi) != 4:
+            raise ValueError("bbox must contain [minLon, minLat, maxLon, maxLat].")
+        min_lon, min_lat, max_lon, max_lat = [float(value) for value in aoi]
+        return ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat])
+    return aoi
 
 
-def _valid_fraction_for_b4(image: ee.Image, aoi: ee.Geometry) -> float:
-    valid_fraction_raw = (
+def _get_collection(aoi: ee.Geometry, start_date: str, end_date: str) -> ee.ImageCollection:
+    return (
+        ee.ImageCollection(S2_COLLECTION_ID)
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", MAX_SCENE_CLOUD_PERCENT))
+        .map(_mask_sentinel2_clouds)
+    )
+
+
+def _valid_pixel_fraction(image: ee.Image, aoi: ee.Geometry) -> float:
+    raw = (
         image.select("B4")
         .mask()
         .rename("valid")
         .reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=aoi,
-            scale=10,
-            maxPixels=1_000_000_000,
+            scale=ANALYSIS_SCALE,
+            maxPixels=MAX_PIXELS,
             bestEffort=True,
         )
         .get("valid")
     )
-    return _safe_number(valid_fraction_raw.getInfo(), 6)
+    return _safe_number(raw.getInfo())
 
 
-def _composite_from_collection(collection: ee.ImageCollection, aoi: ee.Geometry) -> tuple[ee.Image, float]:
-    masked_collection = (
-        collection
-        .map(_mask_clouds_and_shadows)
-        .map(lambda img: img.select(PROCESS_BANDS).toFloat())
+def _get_composite(aoi: ee.Geometry, year: int, month: int, day: int) -> tuple[ee.Image, dict[str, str | int | float]]:
+    windows = [
+        ("45-day median composite", *_build_window(year, month, day, PRIMARY_WINDOW_DAYS)),
+        ("90-day median composite fallback", *_build_window(year, month, day, FALLBACK_WINDOW_DAYS)),
+    ]
+
+    best_image: ee.Image | None = None
+    best_metadata: dict[str, str | int | float] | None = None
+    best_valid_fraction = -1.0
+
+    for source, start_date, end_date in windows:
+        collection = _get_collection(aoi, start_date, end_date)
+        scene_count = int(collection.size().getInfo())
+        if scene_count == 0:
+            continue
+
+        composite = ee.Image(collection.median()).clip(aoi)
+        valid_fraction = _valid_pixel_fraction(composite, aoi)
+        if valid_fraction <= best_valid_fraction:
+            continue
+
+        best_image = composite
+        best_valid_fraction = valid_fraction
+        best_metadata = {
+            "source": source,
+            "sceneCount": scene_count,
+            "windowStart": start_date,
+            "windowEnd": end_date,
+            "validCoveragePercent": round(valid_fraction * 100.0, 4),
+        }
+
+    if best_image is None or best_metadata is None or best_valid_fraction <= 0:
+        raise ValueError("No valid cloud-masked Sentinel-2 imagery was available for the selected year.")
+
+    return best_image, best_metadata
+
+
+def _classify_ndvi(ndvi: ee.Image) -> tuple[ee.Image, ee.Image]:
+    classified = (
+        ee.Image(0)
+        .where(ndvi.gte(NON_VEGETATION_MAX_NDVI).And(ndvi.lte(DENSE_VEGETATION_MIN_NDVI)), 1)
+        .where(ndvi.gt(DENSE_VEGETATION_MIN_NDVI), 2)
+        .updateMask(ndvi.mask())
+        .rename("ndviClass")
     )
-    image = ee.Image(masked_collection.median()).clip(aoi)
-    return image, _valid_fraction_for_b4(image, aoi)
+    vegetation_mask = ndvi.gt(VEGETATION_MASK_THRESHOLD).updateMask(ndvi.mask()).rename("vegetationMask")
+    return classified, vegetation_mask
 
 
-def process_year_with_visuals(
-    aoi: ee.Geometry,
-    year: int,
-    month: int,
-    day: int,
-) -> tuple[dict[str, float | int] | None, dict[str, str] | None, list[str]]:
-    debug: list[str] = []
+def _get_tree_mask(aoi: ee.Geometry) -> ee.Image:
+    return (
+        ee.Image(HANSEN_COLLECTION_ID)
+        .select("treecover2000")
+        .gt(TREE_COVER_THRESHOLD)
+        .clip(aoi)
+        .rename("treeMask")
+    )
 
-    try:
-        month_start = f"{year}-{month:02d}-01"
-        if month == 12:
-            month_end = f"{year + 1}-01-01"
-        else:
-            month_end = f"{year}-{month + 1:02d}-01"
 
-        month_scene_collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(aoi)
-            .filterDate(month_start, month_end)
-            # Keep more scenes and evaluate with pixel-level cloud/shadow masks.
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 80))
-        )
+def _compute_index_stats(composite: ee.Image, ndvi: ee.Image, aoi: ee.Geometry) -> dict[str, float]:
+    ndwi = composite.normalizedDifference(["B3", "B8"]).rename("ndwi")
+    ndmi = composite.normalizedDifference(["B8", "B11"]).rename("ndmi")
+    nbr = composite.normalizedDifference(["B8", "B12"]).rename("nbr")
+    savi = composite.expression(
+        "1.5 * ((nir - red) / (nir + red + 0.5))",
+        {"nir": composite.select("B8"), "red": composite.select("B4")},
+    ).rename("savi")
+    evi = composite.expression(
+        "2.5 * ((nir - red) / (nir + 6.0 * red - 7.5 * blue + 1.0))",
+        {"nir": composite.select("B8"), "red": composite.select("B4"), "blue": composite.select("B2")},
+    ).rename("evi")
 
-        month_image_count = int(month_scene_collection.size().getInfo())
-        msg_count = f"Year {year}, month {month:02d} - scenes found: {month_image_count}"
-        debug.append(msg_count)
-        LOGGER.info(msg_count)
-
-        if month_image_count == 0:
-            warn = f"Year {year}, month {month:02d} - skipped (no images found after cloud filtering)."
-            debug.append(warn)
-            LOGGER.warning(warn)
-            return None, None, debug
-
-        # Primary pass: same month/day window with limited scenes for speed + stability.
-        day_int = min(max(int(day), 1), 28)
-        window_start = f"{year}-{month:02d}-{day_int:02d}"
-        if month == 12:
-            window_end = f"{year + 1}-01-01"
-        else:
-            window_end = f"{year}-{month + 1:02d}-01"
-
-        window_collection = month_scene_collection.filterDate(window_start, window_end).sort("CLOUDY_PIXEL_PERCENTAGE")
-        window_count = int(window_collection.size().getInfo())
-        debug.append(f"Year {year}, month {month:02d} - day-window scenes found: {window_count}")
-
-        if window_count >= MIN_PRIMARY_SCENES:
-            primary_collection = window_collection.limit(PRIMARY_SCENE_LIMIT)
-            source_label = "day-window composite"
-        else:
-            primary_collection = month_scene_collection.sort("CLOUDY_PIXEL_PERCENTAGE").limit(PRIMARY_SCENE_LIMIT)
-            source_label = "month composite fallback"
-
-        used_scene_count = int(primary_collection.size().getInfo())
-        debug.append(f"Year {year}, month {month:02d} - scenes used for analysis: {used_scene_count} ({source_label})")
-        if used_scene_count == 0:
-            warn = f"Year {year}, month {month:02d} - skipped (no scenes available for analysis)."
-            debug.append(warn)
-            LOGGER.warning(warn)
-            return None, None, debug
-
-        image, valid_fraction = _composite_from_collection(primary_collection, aoi)
-        debug.append(f"Year {year}, month {month:02d} - valid pixel coverage: {round(valid_fraction * 100.0, 2)}%")
-        selected_source = source_label
-
-        # Secondary pass: if coverage is poor, use a broader monthly pool.
-        if valid_fraction < MIN_VALID_COVERAGE:
-            fallback_collection = month_scene_collection.sort("CLOUDY_PIXEL_PERCENTAGE").limit(FALLBACK_SCENE_LIMIT)
-            fallback_count = int(fallback_collection.size().getInfo())
-            debug.append(f"Year {year}, month {month:02d} - fallback scenes used: {fallback_count}")
-            if fallback_count > 0:
-                fallback_image, fallback_valid_fraction = _composite_from_collection(fallback_collection, aoi)
-                if fallback_valid_fraction > valid_fraction:
-                    image = fallback_image
-                    valid_fraction = fallback_valid_fraction
-                    selected_source = "broader monthly fallback"
-                    debug.append(
-                        f"Year {year}, month {month:02d} - upgraded to fallback coverage: {round(valid_fraction * 100.0, 2)}%"
-                    )
-
-        if valid_fraction == 0.0:
-            warn = f"Year {year}, month {month:02d} - skipped (no valid cloud-masked pixels in selected/fallback scenes)."
-            debug.append(warn)
-            LOGGER.warning(warn)
-            return None, None, debug
-
-        debug.append(f"Year {year}, month {month:02d} - selected source: {selected_source}")
-
-        ndvi = image.normalizedDifference(["B8", "B4"]).rename("ndvi")
-        ndwi = image.normalizedDifference(["B3", "B8"]).rename("ndwi")
-        ndmi = image.normalizedDifference(["B8", "B11"]).rename("ndmi")
-        savi = image.expression(
-            "1.5 * ((nir - red) / (nir + red + 0.5))",
-            {"nir": image.select("B8"), "red": image.select("B4")},
-        ).rename("savi")
-        evi = image.expression(
-            "2.5 * ((nir - red) / (nir + 6.0 * red - 7.5 * blue + 1.0))",
-            {"nir": image.select("B8"), "red": image.select("B4"), "blue": image.select("B2")},
-        ).rename("evi")
-
-        veg_score = (
-            ndvi.gt(NDVI_VEG_THRESHOLD)
-            .add(evi.gt(EVI_VEG_THRESHOLD))
-            .add(savi.gt(SAVI_VEG_THRESHOLD))
-            .add(ndmi.gt(NDMI_VEG_THRESHOLD))
-            .add(ndwi.gt(NDWI_VEG_THRESHOLD))
-        )
-        veg_mask = veg_score.gte(3).rename("veg")
-
-        stats_raw = ndvi.addBands([ndwi, evi, ndmi, savi, veg_mask]).reduceRegion(
+    stats = (
+        ndvi.addBands([ndwi, evi, ndmi, savi, nbr])
+        .reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=aoi,
-            scale=10,
-            maxPixels=1_000_000_000,
+            scale=ANALYSIS_SCALE,
+            maxPixels=MAX_PIXELS,
             bestEffort=True,
-        ).getInfo()
-
-        ndvi_mean = _safe_number(stats_raw.get("ndvi"), 6)
-        ndwi_mean = _safe_number(stats_raw.get("ndwi"), 6)
-        evi_mean = _safe_number(stats_raw.get("evi"), 6)
-        ndmi_mean = _safe_number(stats_raw.get("ndmi"), 6)
-        savi_mean = _safe_number(stats_raw.get("savi"), 6)
-        veg_percent = round(_safe_number(stats_raw.get("veg"), 6) * 100.0, 4)
-
-        debug.append(f"Year {year}, month {month:02d} - NDVI mean: {ndvi_mean}")
-        debug.append(f"Year {year}, month {month:02d} - NDWI mean: {ndwi_mean}")
-        debug.append(f"Year {year}, month {month:02d} - EVI mean: {evi_mean}")
-        debug.append(f"Year {year}, month {month:02d} - NDMI mean: {ndmi_mean}")
-        debug.append(f"Year {year}, month {month:02d} - SAVI mean: {savi_mean}")
-        debug.append(f"Year {year}, month {month:02d} - Vegetation %: {veg_percent}")
-        LOGGER.info("Year %s month %02d - NDVI mean: %s", year, month, ndvi_mean)
-        LOGGER.info("Year %s month %02d - NDWI mean: %s", year, month, ndwi_mean)
-        LOGGER.info("Year %s month %02d - EVI mean: %s", year, month, evi_mean)
-        LOGGER.info("Year %s month %02d - NDMI mean: %s", year, month, ndmi_mean)
-        LOGGER.info("Year %s month %02d - SAVI mean: %s", year, month, savi_mean)
-        LOGGER.info("Year %s month %02d - Vegetation %%: %s", year, month, veg_percent)
-
-        # Render in Web Mercator and stream as EE tiles.
-        # Keep masked/no-data pixels transparent so they are not visualized as low-NDVI red.
-        ndvi_vis = (
-            ndvi.visualize(min=-0.2, max=0.8, palette=["#d73027", "#fee08b", "#1a9850"])
-            .reproject(crs=WEB_MERCATOR, scale=30)
         )
-        map_id = ndvi_vis.getMapId({})
-        ndvi_tile_url = map_id["tile_fetcher"].url_format
+        .getInfo()
+    )
 
-        feature = {
-            "year": year,
-            "ndvi": ndvi_mean,
-            "vegetationPercent": veg_percent,
-            "ndwi": ndwi_mean,
-            "savi": savi_mean,
-            "evi": evi_mean,
-            "ndmi": ndmi_mean,
-            "nbr": 0.0,
-        }
+    return {
+        "ndvi": _safe_number(stats.get("ndvi")),
+        "ndwi": _safe_number(stats.get("ndwi")),
+        "evi": _safe_number(stats.get("evi")),
+        "ndmi": _safe_number(stats.get("ndmi")),
+        "savi": _safe_number(stats.get("savi")),
+        "nbr": _safe_number(stats.get("nbr")),
+    }
 
-        maps = {
-            "ndviTileUrl": ndvi_tile_url,
-        }
 
-        return feature, maps, debug
-    except Exception as exc:
-        warn = f"Year {year}, month {month:02d} - Earth Engine failure: {exc}"
-        debug.append(warn)
-        LOGGER.warning(warn)
-        return None, None, debug
+def _compute_area_stats(
+    ndvi: ee.Image,
+    classified: ee.Image,
+    vegetation_mask: ee.Image,
+    forest_mask: ee.Image,
+    aoi: ee.Geometry,
+) -> dict[str, float]:
+    pixel_area = ee.Image.pixelArea()
+    area_stats = (
+        pixel_area.updateMask(ndvi.mask())
+        .rename("validArea")
+        .addBands(pixel_area.updateMask(vegetation_mask).rename("vegetationArea"))
+        .addBands(pixel_area.updateMask(forest_mask).rename("forestArea"))
+        .addBands(pixel_area.updateMask(classified.eq(0)).rename("nonVegetationArea"))
+        .addBands(pixel_area.updateMask(classified.eq(1)).rename("sparseVegetationArea"))
+        .addBands(pixel_area.updateMask(classified.eq(2)).rename("denseVegetationArea"))
+        .reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=ANALYSIS_SCALE,
+            maxPixels=MAX_PIXELS,
+            bestEffort=True,
+        )
+        .getInfo()
+    )
+
+    valid_area = _safe_number(area_stats.get("validArea"), 2)
+    denominator = valid_area if valid_area > 0 else 1.0
+
+    vegetation_area = _safe_number(area_stats.get("vegetationArea"), 2)
+    forest_area = _safe_number(area_stats.get("forestArea"), 2)
+    non_vegetation_area = _safe_number(area_stats.get("nonVegetationArea"), 2)
+    sparse_vegetation_area = _safe_number(area_stats.get("sparseVegetationArea"), 2)
+    dense_vegetation_area = _safe_number(area_stats.get("denseVegetationArea"), 2)
+
+    return {
+        "forestAreaSqm": forest_area,
+        "forestPercent": round((forest_area / denominator) * 100.0, 4),
+        "vegetationPercent": round((vegetation_area / denominator) * 100.0, 4),
+        "nonVegetationPercent": round((non_vegetation_area / denominator) * 100.0, 4),
+        "sparseVegetationPercent": round((sparse_vegetation_area / denominator) * 100.0, 4),
+        "denseVegetationPercent": round((dense_vegetation_area / denominator) * 100.0, 4),
+    }
+
+
+def _build_maps(ndvi: ee.Image, classified: ee.Image, vegetation_mask: ee.Image, forest_mask: ee.Image) -> dict[str, str]:
+    ndvi_tile_url = (
+        ndvi.visualize(min=-0.2, max=0.8, palette=["#8c510a", "#f6e8c3", "#c7e9ad", "#1b7837"])
+        .reproject(crs=WEB_MERCATOR, scale=30)
+        .getMapId({})["tile_fetcher"]
+        .url_format
+    )
+    classification_tile_url = (
+        classified.visualize(min=0, max=2, palette=["#8c510a", "#f4d35e", "#1b7837"])
+        .reproject(crs=WEB_MERCATOR, scale=30)
+        .getMapId({})["tile_fetcher"]
+        .url_format
+    )
+    vegetation_mask_tile_url = (
+        vegetation_mask.selfMask()
+        .visualize(min=0, max=1, palette=["#2e7d32"])
+        .reproject(crs=WEB_MERCATOR, scale=30)
+        .getMapId({})["tile_fetcher"]
+        .url_format
+    )
+    forest_mask_tile_url = (
+        forest_mask.selfMask()
+        .visualize(min=0, max=1, palette=["#14532d"])
+        .reproject(crs=WEB_MERCATOR, scale=30)
+        .getMapId({})["tile_fetcher"]
+        .url_format
+    )
+
+    return {
+        "ndviTileUrl": ndvi_tile_url,
+        "classificationTileUrl": classification_tile_url,
+        "vegetationMaskTileUrl": vegetation_mask_tile_url,
+        "forestMaskTileUrl": forest_mask_tile_url,
+    }
+
+
+def process(aoi: ee.Geometry | list[float] | tuple[float, float, float, float], year: int, month: int, day: int) -> dict[str, dict[str, object]]:
+    init_ee()
+    geometry = _normalize_aoi(aoi)
+
+    composite, metadata = _get_composite(geometry, year, month, day)
+    ndvi = composite.normalizedDifference(["B8", "B4"]).rename("ndvi")
+    classified, vegetation_mask = _classify_ndvi(ndvi)
+    tree_mask = _get_tree_mask(geometry)
+    forest_mask = tree_mask.And(ndvi.gt(VEGETATION_MASK_THRESHOLD)).updateMask(ndvi.mask()).rename("forestMask")
+
+    stats = {
+        **_compute_index_stats(composite, ndvi, geometry),
+        **_compute_area_stats(ndvi, classified, vegetation_mask, forest_mask, geometry),
+        **metadata,
+    }
+    maps = {
+        **_build_maps(ndvi, classified, vegetation_mask, forest_mask),
+        "source": str(metadata["source"]),
+    }
+
+    return {"stats": stats, "maps": maps}
